@@ -1,0 +1,8 @@
+rag:
+    ricerca di similarita basata su punteggio con minimo 3 massimo 10 chunk
+
+ todo:
+    aggiungere sistema controllo lunghezza context window
+    aggiungere database vettoriale per contesto conversazionale
+    aggiungere Dynamic Top‑k based on query complexity per selezionari i chunk
+    aggiungere forma converzionale di langgraph
