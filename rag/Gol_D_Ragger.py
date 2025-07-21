@@ -3,6 +3,11 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, Base
 from utilities import EmbeddingManager
 from utilities import QueryProcessor
 from utilities import OllamaConnection
+from utilities import (
+    initialize_conversation_db,
+    store_conversation_pair,
+    get_conversation_context
+)
 
 
 class GoldDRagger:
@@ -10,8 +15,8 @@ class GoldDRagger:
     Classe principale per il chatbot RAG.
 
     Gestisce il flusso conversazionale con messaggi tipizzati LangChain,
-    mantiene la storia della conversazione e orchestra l'interazione tra
-    query processing, embedding, retrieval e LLM.
+    mantiene la storia della conversazione tramite vector database temporaneo
+    e orchestra l'interazione tra query processing, embedding, retrieval e LLM.
     """
 
     def __init__(self, embedding_model: str = "nomic-embed-text",
@@ -25,8 +30,10 @@ class GoldDRagger:
         """
         self.embedding_model = embedding_model
         self.llm_model = llm_model
-        # Cronologia solo Human/AI messages (SystemMessage è dinamico)
-        self.conversation_history: List[BaseMessage] = []
+
+        # Conversation memory temporaneo
+        self.conversation_db_path: Optional[str] = None
+        self.message_counter: int = 0
 
         # Componenti principali
         self.ollama_connection = None
@@ -34,6 +41,7 @@ class GoldDRagger:
         self.embedding_manager = None
 
         self._initialize_components()
+        self._initialize_conversation_memory()
 
     def _initialize_components(self) -> None:
         """Inizializza tutti i componenti necessari."""
@@ -46,6 +54,14 @@ class GoldDRagger:
         # Inizializza embedding manager con client ChromaDB
         chroma_client = self.ollama_connection.get_chroma_client()
         self.embedding_manager = EmbeddingManager(chroma_client)
+
+    def _initialize_conversation_memory(self) -> None:
+        """Inizializza sistema conversation memory temporaneo."""
+        self.conversation_db_path = initialize_conversation_db()
+        if self.conversation_db_path:
+            print("✓ Conversation memory temporaneo inizializzato")
+        else:
+            print("⚠ Conversation memory non disponibile, continuo senza")
 
     def _call_llm(self, messages: List[BaseMessage]) -> str:
         """
@@ -83,47 +99,58 @@ class GoldDRagger:
 
         return context.strip()
 
-    def _build_dynamic_system_message(self, context: str) -> SystemMessage:
+    def _build_dynamic_system_message(self, context: str, conversation_context: str) -> SystemMessage:
         """
-        Costruisce il SystemMessage dinamico con template RAG e contesto.
+        Costruisce il SystemMessage dinamico con template RAG, contesto e conversation history.
 
         Args:
             context: Contesto dai documenti recuperati
+            conversation_context: Contesto delle conversazioni precedenti
 
         Returns:
-            SystemMessage con istruzioni RAG e contesto aggiornato
+            SystemMessage con istruzioni RAG, contesto documenti e conversation history
         """
-        system_content = f"""Sei un assistente esperto specializzato in Statistica. Il tuo compito è rispondere
-         alle domande degli utenti basandoti esclusivamente sul contesto fornito dal manuale tecnico.
+        # Template base senza XML tags
+        base_template = """You are an expert assistant specialized in Statistics. Your task is to answer
+        user questions based exclusively on the provided context and conversational history.
 
         **Generate Response to User Query**
-        
+
         **Step 1: Parse Context Information**
         Extract and utilize relevant knowledge from the provided context within `<context></context>` XML tags.
-        
-        **Step 2: Analyze User Query**
-        Carefully read and comprehend the user's query, pinpointing the key concepts, entities, and intent behind the
-         question.
-        
-        **Step 3: Determine Response**
-        If the answer to the user's query can be directly inferred from the context information, provide a concise and
-         accurate response in the same language as the user's query.
-        
-        **Step 4: Handle Uncertainty**
-        If the answer is not clear, ask the user for clarification to ensure an accurate response.
-        
-        **Step 5: Avoid Context Attribution**
-        When formulating your response, do not indicate that the information was derived from the context.
-        
-        **Step 6: Respond in User's Language**
-        Maintain consistency by ensuring the response is in the same language as the user's query.
-        
-        **Step 7: Provide Response**
-        Generate a clear, concise, and informative response to the user's query, adhering to the guidelines outlined above.
-        
-        <context>
-        {context}
-        </context>"""
+
+        **Step 2: Consider Previous Conversation**
+        If conversation history is available in `<conversation_history></conversation_history>` XML tags, use it to understand ongoing discussion context, maintain conversation continuity, and answer specific questions about previous exchanges (e.g., "what did I ask before?", "repeat my last question").
+
+        **Step 3: Handle Meta-Conversational Queries**
+        If user asks about previous questions, topics discussed, or conversation history, respond directly using the conversation_history content.
+
+        **Step 4: Analyze Current User Query**
+        Carefully read the user's query, considering both document context and conversation context to provide relevant responses.
+
+        **Step 5: Determine and Provide Response**
+        Generate a clear, accurate response in the user's language. If uncertain, ask for clarification. Never mention that information comes from context or conversation history.
+
+        **Step 6: Provide Response**
+        Deliver the final response following the guidelines above."""
+
+        system_content = base_template
+
+        # Aggiungi conversation history se presente (prima del context)
+        if conversation_context.strip():
+            system_content += f"""
+
+            <conversation_history>
+            {conversation_context}
+            </conversation_history>"""
+
+        # Aggiungi context se presente
+        if context.strip():
+            system_content += f"""
+
+            <context>
+            {context}
+            </context>"""
 
         return SystemMessage(content=system_content)
 
@@ -158,29 +185,33 @@ class GoldDRagger:
 
         return formatted_response
 
-    def _update_conversation_history(self, user_msg: str, bot_response: str) -> None:
+    def _store_conversation_turn(self, user_msg: str, bot_response: str) -> None:
         """
-        Aggiorna la storia della conversazione con messaggi tipizzati.
+        Salva coppia conversazione nel vector database temporaneo con message_order.
 
         Args:
-            user_msg: Messaggio dell'utente
-            bot_response: Risposta del bot
+            user_msg: Messaggio dell'utente (query originale)
+            bot_response: Risposta del bot (verrà divisa in chunk da 300 caratteri)
         """
-        # Aggiunge messaggi tipizzati
-        self.conversation_history.append(HumanMessage(content=user_msg))
-        self.conversation_history.append(AIMessage(content=bot_response))
+        if self.conversation_db_path:
+            self.message_counter += 1
+            success = store_conversation_pair(
+                self.conversation_db_path,
+                user_msg,
+                bot_response,
+                self.message_counter
+            )
+            if not success:
+                print("⚠ Impossibile salvare conversazione, continuo senza memory")
 
-        # Mantiene solo ultimi 5 scambi (10 messaggi: 5 Human + 5 AI)
-        if len(self.conversation_history) > 10:
-            self.conversation_history = self.conversation_history[-10:]
-
-    def _build_messages_for_llm(self, user_query: str, context: str) -> List[BaseMessage]:
+    def _build_messages_for_llm(self, user_query: str, context: str, conversation_context: str) -> List[BaseMessage]:
         """
         Costruisce la lista completa di messaggi per il LLM.
 
         Args:
             user_query: Query corrente dell'utente
             context: Contesto RAG dai documenti recuperati
+            conversation_context: Contesto dalle conversazioni precedenti
 
         Returns:
             Lista completa di messaggi tipizzati per il LLM
@@ -188,14 +219,11 @@ class GoldDRagger:
         # Lista messaggi da inviare al LLM
         messages = []
 
-        # 1. SystemMessage dinamico con contesto RAG aggiornato
-        system_message = self._build_dynamic_system_message(context)
+        # 1. SystemMessage dinamico con contesto RAG e conversation history
+        system_message = self._build_dynamic_system_message(context, conversation_context)
         messages.append(system_message)
 
-        # 2. Cronologia conversazionale (Human/AI alternati)
-        messages.extend(self.conversation_history)
-
-        # 3. Query corrente dell'utente
+        # 2. Query corrente dell'utente (no conversation history in messaggi)
         current_human_message = HumanMessage(content=user_query)
         messages.append(current_human_message)
 
@@ -203,7 +231,7 @@ class GoldDRagger:
 
     def _process_user_input(self, user_input: str) -> str:
         """
-        Processa l'input dell'utente attraverso la pipeline RAG completa.
+        Processa l'input dell'utente attraverso la pipeline RAG completa con conversation memory.
 
         Args:
             user_input: Input dell'utente
@@ -214,23 +242,28 @@ class GoldDRagger:
         # 1. Preprocessing della query
         processed_query = self.query_processor.process_query(user_input)
 
-        # 2. Ricerca semantica
+        # 2. Ricerca semantica nei documenti
         results = self.embedding_manager.similarity_search(processed_query)
 
-        # 3. Costruzione contesto RAG
-        context = self._build_context_from_results(results)
+        # 3. Costruzione contesto RAG dai documenti
+        document_context = self._build_context_from_results(results)
 
-        # 4. Costruzione messaggi completi per LLM
-        messages = self._build_messages_for_llm(user_input, context)
+        # 4. Recupero conversation context tramite similarity search
+        conversation_context = ""
+        if self.conversation_db_path:
+            conversation_context = get_conversation_context(self.conversation_db_path, processed_query)
 
-        # 5. Chiamata LLM con messaggi tipizzati
+        # 5. Costruzione messaggi completi per LLM
+        messages = self._build_messages_for_llm(user_input, document_context, conversation_context)
+
+        # 6. Chiamata LLM con messaggi tipizzati
         response = self._call_llm(messages)
 
-        # 6. Formattazione risposta con fonti
+        # 7. Formattazione risposta con fonti
         formatted_response = self._format_response_with_sources(response, results)
 
-        # 7. Aggiornamento storia conversazione
-        self._update_conversation_history(user_input, formatted_response)
+        # 8. Storage conversazione nel vector database temporaneo
+        self._store_conversation_turn(user_input, formatted_response)
 
         return formatted_response
 
@@ -248,17 +281,25 @@ class GoldDRagger:
 
         if user_input == '/help':
             return """Comandi disponibili:
-        /help - Mostra questo messaggio
-        /clear - Cancella la cronologia conversazione
-        /quit o /exit - Esci dal chat
-        
-        Puoi fare domande sulla tua Ducati e riceverai risposte basate sul manuale."""
+            /help - Mostra questo messaggio
+            /clear - Cancella la conversation memory
+            /quit o /exit - Esci dal chat
+
+            Puoi fare domande sul manuale e riceverai risposte basate sui documenti.
+            La conversazione precedente viene utilizzata per mantenere il contesto."""
 
         elif user_input == '/clear':
-            self.conversation_history = []
-            return "Cronologia conversazione cancellata."
+            # Reinizializza conversation memory
+            self._initialize_conversation_memory()
+            self.message_counter = 0
+            return "Conversation memory cancellata e reinizializzata."
 
         return None
+
+    def _cleanup_on_exit(self) -> None:
+        """Cleanup risorse al termine della conversazione."""
+        # Il database temporaneo verrà eliminato al prossimo avvio
+        pass
 
     def chat(self) -> None:
         """
@@ -267,26 +308,31 @@ class GoldDRagger:
         print("Ciao, hai domande sul Rif Estimator?")
         print("Digita /help per vedere i comandi disponibili.")
 
-        while True:
-            user_input = input("\nTu: ")
+        try:
+            while True:
+                user_input = input("\nTu: ")
 
-            if user_input.lower() in ['quit', 'exit', 'bye', '/quit', '/exit']:
-                print("Arrivederci!")
-                break
+                if user_input.lower() in ['quit', 'exit', 'bye', '/quit', '/exit']:
+                    print("Arrivederci!")
+                    break
 
-            # Gestione comandi speciali
-            special_response = self._handle_special_commands(user_input)
-            if special_response:
-                print(f"Bot: {special_response}")
-                continue
+                # Gestione comandi speciali
+                special_response = self._handle_special_commands(user_input)
+                if special_response:
+                    print(f"Bot: {special_response}")
+                    continue
 
-            # Pipeline RAG completa
-            try:
-                response = self._process_user_input(user_input)
-                print(f"Bot: {response}")
-            except Exception as e:
-                print(f"Bot: Ops, ho avuto un problema. Riprova.")
-                print(f"Errore: {e}")
+                # Pipeline RAG completa con conversation memory
+                try:
+                    response = self._process_user_input(user_input)
+                    print(f"Bot: {response}")
+                except Exception as e:
+                    print(f"Bot: Ops, ho avuto un problema. Riprova.")
+                    print(f"Errore: {e}")
+
+        finally:
+            # Cleanup garantito anche in caso di interruzione
+            self._cleanup_on_exit()
 
 
 if __name__ == "__main__":
