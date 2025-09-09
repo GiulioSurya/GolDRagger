@@ -4,7 +4,10 @@ from datetime import datetime, timezone
 import threading
 import time
 import re
+import json
 from enum import Enum
+from multi_agent_system.core.prompts import BASE_REACT_PROMPT, BASE_ACTING_PROMPT
+import textwrap
 
 # Import dai moduli esistenti
 from multi_agent_system.core.messages import (
@@ -21,267 +24,32 @@ class AgentStatus(Enum):
     ERROR = "error"
 
 
-class BaseAgent(ABC):
-    """
-    Classe base ABC standardizzata con ReAct loop integrato.
+# ===== STRATEGY PATTERN INTERNO =====
 
-    CARATTERISTICHE AUTOMATICHE:
-    - System prompt ReAct generico con tool auto-discovery
-    - Loop ReAct standardizzato: Thought → Action → PAUSE → Observation
-    - Integration con blackboard per observations
-    - LLM client configurabile per ogni agent derivato
-    - Completamente sincrono
+class _PromptStrategy(ABC):
+    """Strategy interna per gestire diversi tipi di prompt"""
 
-    GLI AGENT DERIVATI DEVONO SOLO:
-    - Implementare setup_tools() per registrare i loro tool specifici
-    - Passare LLM client nel constructor
-    - Il resto è automatico!
-    """
+    @abstractmethod
+    def execute_task_loop(self, agent: 'BaseAgent', task_data: Dict, task_id: str) -> AgentResult:
+        """Esegue il loop specifico per questa strategy"""
+        pass
 
-    # ReAct System Prompt STANDARDIZZATO con auto-inject tool info
-    BASE_REACT_PROMPT = """You are an AI agent that operates using the ReAct (Reasoning and Acting) pattern.
+    @abstractmethod
+    def build_system_prompt(self, agent: 'BaseAgent') -> str:
+        """Costruisce il system prompt per questa strategy"""
+        pass
 
-You run in a loop of Thought, Action, PAUSE, Observation until you can provide a final Answer.
 
-WORKFLOW:
-1. Thought: Describe your reasoning about the current task
-2. Action: Execute one of your available tools using the exact format shown below  
-3. PAUSE: Always return PAUSE after an Action and wait for Observation
-4. Observation: Will contain the result of your Action (provided automatically)
-5. Repeat steps 1-4 until you have enough information
-6. Answer: Provide your final response when ready
+class _ReactStrategy(_PromptStrategy):
+    """Strategy per ReAct pattern con tool usage e loop PAUSE/Observation"""
 
-ACTION FORMAT:
-Action: tool_name: parameters_as_json
-
-EXAMPLE:
-Thought: I need to read emails to help the user
-Action: gmail_reader: {{"max_results": 10, "query": "is:unread"}}
-PAUSE
-
-You will then receive:
-Observation: [tool result will be inserted here]
-
-Continue this pattern until you can provide a final Answer.
-
-AVAILABLE TOOLS:
-{tools_description}
-
-IMPORTANT:
-- Always use exact tool names from the list above
-- Follow the JSON parameter format exactly
-- Always return PAUSE after Action
-- End with Answer: when you have the final response"""
-
-    def __init__(self, agent_id: str, blackboard: BlackBoard, llm_client):
-        """
-        Inizializza BaseAgent con ReAct standardizzato.
-
-        Args:
-            agent_id: ID univoco dell'agent
-            blackboard: Blackboard condivisa del sistema
-            llm_client: Client LLM (deve avere metodo invoke(system, user))
-        """
-        self.agent_id = agent_id
-        self.blackboard = blackboard
-        self.llm_client = llm_client
-
-        # Status e controllo thread-safe
-        self._status = AgentStatus.IDLE
-        self._lock = threading.RLock()
-
-        # Tool management
-        self._tools: Dict[str, ToolBase] = {}
-
-        # Task corrente
-        self._current_task: Optional[Dict] = None
-
-        # Statistiche
-        self._stats = {
-            "tasks_completed": 0,
-            "tasks_failed": 0,
-            "total_react_steps": 0,
-            "tools_used_count": {},
-            "last_activity": None
-        }
-
-        # Setup observer per task assegnati automaticamente
-        self._setup_task_observer()
-
-    def _setup_task_observer(self):
-        """Osserva blackboard per task assegnati a questo agent"""
-
-        def on_blackboard_change(change: BlackboardChange):
-            try:
-                # Controlla se è un task per questo agent
-                if (change.key.startswith(f"task_{self.agent_id}_") and
-                        change.new_value and
-                        change.new_value.get("status") == "pending"):
-                    self._handle_assigned_task(change.new_value)
-
-            except Exception as e:
-                print(f"Error in task observer for {self.agent_id}: {str(e)}")
-
-        self.blackboard.subscribe_to_changes(on_blackboard_change)
-
-    def _handle_assigned_task(self, task: Dict):
-        """Gestisce task assegnato dalla blackboard con ReAct loop"""
-        with self._lock:
-            if self._status == AgentStatus.WORKING:
-                return
-
-            self._status = AgentStatus.WORKING
-            self._current_task = task
-
-        try:
-            # Esegue ReAct loop per il task
-            result = self._execute_react_loop(task["task_data"], task["task_id"])
-
-            # Aggiorna risultato sulla blackboard
-            success = self.blackboard.update_task_result(
-                task_id=task["task_id"],
-                agent_id=self.agent_id,
-                result=result.data if result.success else {"error": result.error},
-                status="completed" if result.success else "failed",
-                execution_time=result.execution_time
-            )
-
-            if success and result.success:
-                self._stats["tasks_completed"] += 1
-                self._stats["total_react_steps"] += result.react_steps
-            else:
-                self._stats["tasks_failed"] += 1
-
-        except Exception as e:
-            print(f"Task execution failed for {self.agent_id}: {str(e)}")
-
-            # Marca task come fallito
-            self.blackboard.update_task_result(
-                task_id=task["task_id"],
-                agent_id=self.agent_id,
-                result={"error": str(e)},
-                status="failed"
-            )
-            self._stats["tasks_failed"] += 1
-
-        finally:
-            with self._lock:
-                self._status = AgentStatus.IDLE
-                self._current_task = None
-                self._stats["last_activity"] = datetime.now(timezone.utc)
-
-    def _execute_react_loop(self, task_data: Dict, task_id: str) -> AgentResult:
-        """
-        Esegue il ReAct loop standardizzato.
-
-        Args:
-            task_data: Dati del task
-            task_id: ID del task per observation storage
-
-        Returns:
-            AgentResult: Risultato finale con step ReAct tracciati
-        """
-        start_time = time.time()
-        react_steps = 0
-        tools_used = []
-        observations = []
-        max_steps = 10  # Limite safety per evitare loop infiniti
-
-        try:
-            # Costruisce system prompt con tool info auto-injected
-            system_prompt = self._build_react_system_prompt()
-
-            # Prompt iniziale per il task
-            conversation = f"Task: {task_data}\n\nPlease start with your first Thought about this task."
-
-            while react_steps < max_steps:
-                # Chiama LLM
-                llm_response = self.llm_client.invoke(
-                    system=system_prompt,
-                    user=conversation
-                )
-                print(f"[{self.agent_id}] LLM Response (step {react_steps}): {llm_response[:200]}...")
-
-                # Parsing della risposta LLM
-                if "Answer:" in llm_response:
-                    # LLM ha dato risposta finale
-                    answer = self._extract_answer(llm_response)
-                    return create_agent_result(
-                        success=True,
-                        agent_id=self.agent_id,
-                        data={"answer": answer, "task_data": task_data},
-                        execution_time=time.time() - start_time,
-                        react_steps=react_steps,
-                        tools_used=tools_used,
-                        observations=observations
-                    )
-
-                elif "Action:" in llm_response and "PAUSE" in llm_response:
-                    # LLM vuole eseguire un'azione
-                    action_result = self._process_action(llm_response, task_id)
-
-                    if action_result["success"]:
-                        # Tool eseguito con successo
-                        tool_name = action_result["tool_name"]
-                        observation = action_result["observation"]
-
-                        # Tracking
-                        if tool_name not in tools_used:
-                            tools_used.append(tool_name)
-                        observations.append(observation)
-
-                        # Aggiorna stats
-                        self._stats["tools_used_count"][tool_name] = (
-                                self._stats["tools_used_count"].get(tool_name, 0) + 1
-                        )
-
-                        # Salva observation sulla blackboard
-                        self._save_observation_to_blackboard(task_id, react_steps, observation)
-
-                        # Continua conversazione con observation
-                        conversation += f"\n\n{llm_response}\n\nObservation: {observation}"
-
-                    else:
-                        # Tool fallito
-                        error_obs = f"Error: {action_result['error']}"
-                        observations.append(error_obs)
-                        conversation += f"\n\n{llm_response}\n\nObservation: {error_obs}"
-
-                    react_steps += 1
-
-                else:
-                    # Risposta LLM non nel formato atteso
-                    conversation += f"\n\n{llm_response}\n\nPlease follow the format: Thought: ... Action: tool_name: params PAUSE"
-
-            # Raggiunto limite step
-            return create_agent_result(
-                success=False,
-                agent_id=self.agent_id,
-                error=f"Reached maximum ReAct steps ({max_steps})",
-                execution_time=time.time() - start_time,
-                react_steps=react_steps,
-                tools_used=tools_used,
-                observations=observations
-            )
-
-        except Exception as e:
-            return create_agent_result(
-                success=False,
-                agent_id=self.agent_id,
-                error=f"ReAct loop failed: {str(e)}",
-                execution_time=time.time() - start_time,
-                react_steps=react_steps,
-                tools_used=tools_used,
-                observations=observations
-            )
-
-    def _build_react_system_prompt(self) -> str:
+    def build_system_prompt(self, agent: 'BaseAgent') -> str:
         """Costruisce system prompt ReAct con tool descriptions auto-injected"""
 
         # Costruisce descrizioni tool automaticamente
         tools_descriptions = []
 
-        for tool_name, tool in self._tools.items():
+        for tool_name, tool in agent._tools.items():
             schema = tool.get_schema()
 
             # Estrae parametri con tipi
@@ -318,8 +86,8 @@ IMPORTANT:
             tools_descriptions.append(tool_desc)
 
         # Aggiunge system instructions dinamiche dalla blackboard
-        system_instructions = self.blackboard.get_system_instructions_for_agent(
-            self.agent_id, active_only=True
+        system_instructions = agent.blackboard.get_system_instructions_for_agent(
+            agent.agent_id, active_only=True
         )
 
         additional_instructions = ""
@@ -333,27 +101,362 @@ IMPORTANT:
         # Combina tutto
         tools_section = "\n".join(tools_descriptions) if tools_descriptions else "No tools available"
 
-        final_prompt = self.BASE_REACT_PROMPT.format(
+        final_prompt = BASE_REACT_PROMPT.format(
             tools_description=tools_section
         ) + additional_instructions
 
         return final_prompt
 
-    def _process_action(self, llm_response: str, task_id: str) -> Dict[str, Any]:
-        """Processa azione richiesta dall'LLM ed esegue tool"""
+    def execute_task_loop(self, agent: 'BaseAgent', task_data: Dict, task_id: str) -> AgentResult:
+        """Esegue il ReAct loop con tool usage e PAUSE/Observation"""
+        start_time = time.time()
+        react_steps = 0
+        tools_used = []
+        observations = []
+        max_steps = 10  # Limite safety per evitare loop infiniti
+
         try:
-            # Estrae azione usando regex
-            action_pattern = r"Action:\s*(\w+):\s*({.*?})"
-            match = re.search(action_pattern, llm_response, re.DOTALL)
+            # Costruisce system prompt con tool info auto-injected
+            system_prompt = self.build_system_prompt(agent)
+
+            # Prompt iniziale per il task
+            conversation = f"Task: {task_data}\n\nPlease start with your first Thought about this task."
+
+            while react_steps < max_steps:
+                # Chiama LLM
+                llm_response = agent.llm_client.invoke(
+                    system=system_prompt,
+                    user=conversation
+                )
+                wrapped_response = textwrap.fill(llm_response, width=80)
+                print(f"[{agent.agent_id}] Acting Response: {wrapped_response}")
+
+
+                # Parsing della risposta LLM
+                if "Answer:" in llm_response:
+                    # LLM ha dato risposta finale
+                    answer = agent._extract_answer(llm_response)
+                    return create_agent_result(
+                        success=True,
+                        agent_id=agent.agent_id,
+                        data={"answer": answer, "task_data": task_data},
+                        execution_time=time.time() - start_time,
+                        react_steps=react_steps,
+                        tools_used=tools_used,
+                        observations=observations
+                    )
+
+                elif "Action:" in llm_response and "PAUSE" in llm_response:
+                    # LLM vuole eseguire un'azione
+                    action_result = agent._process_action(llm_response, task_id)
+
+                    if action_result["success"]:
+                        # Tool eseguito con successo
+                        tool_name = action_result["tool_name"]
+                        observation = action_result["observation"]
+
+                        # Tracking
+                        if tool_name not in tools_used:
+                            tools_used.append(tool_name)
+                        observations.append(observation)
+
+                        # Aggiorna stats
+                        agent._stats["tools_used_count"][tool_name] = (
+                                agent._stats["tools_used_count"].get(tool_name, 0) + 1
+                        )
+
+                        # Salva observation sulla blackboard
+                        agent._save_observation_to_blackboard(task_id, react_steps, observation)
+
+                        # Continua conversazione con observation
+                        conversation += f"\n\n{llm_response}\n\nObservation: {observation}"
+
+                    else:
+                        # Tool fallito
+                        error_obs = f"Error: {action_result['error']}"
+                        observations.append(error_obs)
+                        conversation += f"\n\n{llm_response}\n\nObservation: {error_obs}"
+
+                    react_steps += 1
+
+                else:
+                    # Risposta LLM non nel formato atteso
+                    conversation += f"\n\n{llm_response}\n\nPlease follow the format: Thought: ... Action: tool_name: params PAUSE"
+
+            # Raggiunto limite step
+            return create_agent_result(
+                success=False,
+                agent_id=agent.agent_id,
+                error=f"Reached maximum ReAct steps ({max_steps})",
+                execution_time=time.time() - start_time,
+                react_steps=react_steps,
+                tools_used=tools_used,
+                observations=observations
+            )
+
+        except Exception as e:
+            return create_agent_result(
+                success=False,
+                agent_id=agent.agent_id,
+                error=f"ReAct loop failed: {str(e)}",
+                execution_time=time.time() - start_time,
+                react_steps=react_steps,
+                tools_used=tools_used,
+                observations=observations
+            )
+
+
+class _ActingStrategy(_PromptStrategy):
+    """Strategy per Acting pattern: single-shot diretto, no tool, solo reasoning"""
+
+    def build_system_prompt(self, agent: 'BaseAgent') -> str:
+        """Costruisce system prompt Acting senza tool descriptions"""
+
+        # Aggiunge system instructions dinamiche dalla blackboard
+        system_instructions = agent.blackboard.get_system_instructions_for_agent(
+            agent.agent_id, active_only=True
+        )
+
+        additional_instructions = ""
+        if system_instructions:
+            instructions_text = [f"- {instr.instruction_text}" for instr in system_instructions]
+            additional_instructions = f"""
+
+    ADDITIONAL DYNAMIC INSTRUCTIONS:
+    {chr(10).join(instructions_text)}"""
+
+        return BASE_ACTING_PROMPT + additional_instructions
+
+    def execute_task_loop(self, agent: 'BaseAgent', task_data: Dict, task_id: str) -> AgentResult:
+        """Esegue single-shot diretto: una chiamata LLM e basta"""
+        start_time = time.time()
+
+        try:
+            # Costruisce system prompt senza tool info
+            system_prompt = self.build_system_prompt(agent)
+
+            # Prompt diretto per il task
+            user_prompt = f"Task: {task_data}\n\nPlease provide your direct response to complete this task efficiently."
+
+            # Singola chiamata LLM
+            llm_response = agent.llm_client.invoke(
+                system=system_prompt,
+                user=user_prompt
+            )
+
+            wrapped_response = textwrap.fill(llm_response, width=80)
+            print(f"[{agent.agent_id}] Acting Response: {wrapped_response}")
+
+            agent._save_observation_to_blackboard(task_id, 0, f"Direct response: {llm_response[:100]}...")
+
+            return create_agent_result(
+                success=True,
+                agent_id=agent.agent_id,
+                data={"answer": llm_response.strip(), "task_data": task_data},
+                execution_time=time.time() - start_time,
+                react_steps=1,  # Un singolo "step"
+                tools_used=[],  # Nessun tool usato
+                observations=[f"Direct reasoning completed"]
+            )
+
+        except Exception as e:
+            return create_agent_result(
+                success=False,
+                agent_id=agent.agent_id,
+                error=f"Acting execution failed: {str(e)}",
+                execution_time=time.time() - start_time,
+                react_steps=0,
+                tools_used=[],
+                observations=[]
+            )
+
+
+# ===== BASE AGENT AGGIORNATO =====
+
+class BaseAgent(ABC):
+    """
+    Classe base ABC standardizzata con ReAct/Acting pattern configurabile.
+
+    CARATTERISTICHE AUTOMATICHE:
+    - System prompt ReAct O Acting configurabile via parametro
+    - ReAct mode: Tool usage + loop PAUSE/Observation
+    - Acting mode: No tool + single-shot diretto
+    - LLM client auto-configurato per mode scelto
+    - Integration con blackboard per observations
+    - Completamente sincrono
+
+    GLI AGENT DERIVATI DEVONO SOLO:
+    - Implementare setup_tools() per registrare i loro tool (se react=True)
+    - Passare LLM client nel constructor
+    - Il resto Ã¨ automatico!
+    """
+
+    def __init__(self, agent_id: str, blackboard: BlackBoard, llm_client, react: bool = True):
+        """
+        Inizializza BaseAgent con ReAct/Acting configurabile.
+
+        Args:
+            agent_id: ID univoco dell'agent
+            blackboard: Blackboard condivisa del sistema
+            llm_client: Client LLM (deve avere metodo invoke(system, user))
+            react: True per ReAct mode (tool+loop), False per Acting mode (direct)
+        """
+        self.agent_id = agent_id
+        self.blackboard = blackboard
+        self.llm_client = llm_client
+        self._react_mode = react
+
+        # AUTO-configura LLM client per il mode scelto
+        self.llm_client.set_react_mode(react)
+
+        # Status e controllo thread-safe
+        self._status = AgentStatus.IDLE
+        self._lock = threading.RLock()
+
+        # Tool management (solo per ReAct mode)
+        self._tools: Dict[str, ToolBase] = {}
+
+        # Strategy interna per gestire prompt/loop
+        self._prompt_strategy = _ReactStrategy() if react else _ActingStrategy()
+
+        # Task corrente
+        self._current_task: Optional[Dict] = None
+
+        # Statistiche
+        self._stats = {
+            "tasks_completed": 0,
+            "tasks_failed": 0,
+            "total_react_steps": 0,
+            "tools_used_count": {},
+            "last_activity": None
+        }
+
+        # Setup observer per task assegnati automaticamente
+        self._setup_task_observer()
+
+    def _setup_task_observer(self):
+        """Osserva blackboard per task assegnati a questo agent"""
+
+        def on_blackboard_change(change: BlackboardChange):
+            try:
+                # Controlla se Ã¨ un task per questo agent
+                if (change.key.startswith(f"task_{self.agent_id}_") and
+                        change.new_value and
+                        change.new_value.get("status") == "pending"):
+                    self._handle_assigned_task(change.new_value)
+
+            except Exception as e:
+                print(f"Error in task observer for {self.agent_id}: {str(e)}")
+
+        self.blackboard.subscribe_to_changes(on_blackboard_change)
+
+    def _handle_assigned_task(self, task: Dict):
+        """Gestisce task assegnato dalla blackboard con strategy pattern"""
+        with self._lock:
+            if self._status == AgentStatus.WORKING:
+                return
+
+            self._status = AgentStatus.WORKING
+            self._current_task = task
+
+        try:
+            # Esegue task con strategy appropriata (ReAct o Acting)
+            result = self._prompt_strategy.execute_task_loop(
+                self, task["task_data"], task["task_id"]
+            )
+
+            # Aggiorna risultato sulla blackboard
+            success = self.blackboard.update_task_result(
+                task_id=task["task_id"],
+                agent_id=self.agent_id,
+                result=result.data if result.success else {"error": result.error},
+                status="completed" if result.success else "failed",
+                execution_time=result.execution_time
+            )
+
+            if success and result.success:
+                self._stats["tasks_completed"] += 1
+                self._stats["total_react_steps"] += result.react_steps
+            else:
+                self._stats["tasks_failed"] += 1
+
+        except Exception as e:
+            print(f"Task execution failed for {self.agent_id}: {str(e)}")
+
+            # Marca task come fallito
+            self.blackboard.update_task_result(
+                task_id=task["task_id"],
+                agent_id=self.agent_id,
+                result={"error": str(e)},
+                status="failed"
+            )
+            self._stats["tasks_failed"] += 1
+
+        finally:
+            with self._lock:
+                self._status = AgentStatus.IDLE
+                self._current_task = None
+                self._stats["last_activity"] = datetime.now(timezone.utc)
+
+    def _extract_action_json_robust(self, text: str, tool_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Estrae JSON da Action: {tool_name}: {json} gestendo qualsiasi livello di annidamento.
+
+        Args:
+            text: Testo da cui estrarre il JSON
+            tool_name: Nome del tool da cercare nel pattern
+
+        Returns:
+            Optional[Dict]: JSON estratto o None se non trovato/invalido
+        """
+        try:
+            # Trova l'inizio del pattern
+            pattern = f"Action:\\s*{re.escape(tool_name)}:\\s*"
+            match = re.search(pattern, text, re.DOTALL)
 
             if not match:
+                return None
+
+            start_pos = match.end()
+
+            # Trova la prima graffa
+            while start_pos < len(text) and text[start_pos] != '{':
+                start_pos += 1
+
+            if start_pos >= len(text):
+                return None
+
+            # Usa JSONDecoder per parsing automatico e robusto
+            decoder = json.JSONDecoder()
+            try:
+                obj, end_idx = decoder.raw_decode(text, start_pos)
+                return obj
+            except json.JSONDecodeError:
+                return None
+
+        except Exception:
+            return None
+
+    def _process_action(self, llm_response: str, task_id: str) -> Dict[str, Any]:
+        """Processa azione richiesta dall'LLM ed esegue tool (solo ReAct mode) con estrazione JSON robusta"""
+        if not self._react_mode:
+            return {
+                "success": False,
+                "error": "Tool usage not available in Acting mode"
+            }
+
+        try:
+            # Estrae nome del tool prima usando regex semplice
+            tool_name_pattern = r"Action:\s*(\w+):"
+            tool_match = re.search(tool_name_pattern, llm_response, re.DOTALL)
+
+            if not tool_match:
                 return {
                     "success": False,
                     "error": "Could not parse action format. Use: Action: tool_name: {params}"
                 }
 
-            tool_name = match.group(1).strip()
-            params_json = match.group(2).strip()
+            tool_name = tool_match.group(1).strip()
 
             # Verifica tool esistente
             if tool_name not in self._tools:
@@ -363,14 +466,13 @@ IMPORTANT:
                     "error": f"Tool '{tool_name}' not available. Available: {available_tools}"
                 }
 
-            # Parse parametri JSON
-            import json
-            try:
-                params = json.loads(params_json)
-            except json.JSONDecodeError as e:
+            # Estrae parametri usando il metodo robusto
+            params = self._extract_action_json_robust(llm_response, tool_name)
+
+            if params is None:
                 return {
                     "success": False,
-                    "error": f"Invalid JSON parameters: {str(e)}"
+                    "error": f"Could not parse JSON parameters for tool '{tool_name}'"
                 }
 
             # Esegue tool
@@ -414,10 +516,11 @@ IMPORTANT:
                 "step": step,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "agent_id": self.agent_id,
-                "task_id": task_id
+                "task_id": task_id,
+                "mode": "react" if self._react_mode else "acting"
             },
             updated_by=self.agent_id,
-            tags=["observation", "react_step", self.agent_id]
+            tags=["observation", "react_step" if self._react_mode else "acting_step", self.agent_id]
         )
 
     # ===== METODI ABSTRACT - DA IMPLEMENTARE NEGLI AGENT DERIVATI =====
@@ -428,10 +531,13 @@ IMPORTANT:
         Registra i tool specifici dell'agent.
         UNICO METODO DA IMPLEMENTARE negli agent derivati.
 
-        Esempio:
+        NOTE: Se react=False, questo metodo puÃ² essere vuoto o non registrare tool
+
+        Esempio per ReAct mode:
         def setup_tools(self):
-            gmail_tool = GmailReaderTool(self.credentials)
-            self.register_tool(gmail_tool)
+            if self._react_mode:  # Solo se in ReAct mode
+                gmail_tool = GmailReaderTool(self.credentials)
+                self.register_tool(gmail_tool)
         """
         pass
 
@@ -441,6 +547,7 @@ IMPORTANT:
         """Inizializza l'agent (chiamato automaticamente)"""
         try:
             # Setup tool specifici (implementato da classe derivata)
+            # Gli agent Acting possono non registrare tool
             self.setup_tools()
 
             # Verifica dipendenze
@@ -448,6 +555,8 @@ IMPORTANT:
                 return False
 
             self._status = AgentStatus.IDLE
+            print(
+                f"[{self.agent_id}] Initialized in {'ReAct' if self._react_mode else 'Acting'} mode with {len(self._tools)} tools")
             return True
 
         except Exception as e:
@@ -456,12 +565,23 @@ IMPORTANT:
             return False
 
     def register_tool(self, tool: ToolBase):
-        """Registra un tool nell'agent"""
+        """Registra un tool nell'agent (solo per ReAct mode)"""
+        if not self._react_mode:
+            print(f"[{self.agent_id}] Warning: Tool registration ignored in Acting mode")
+            return
+
         tool_name = tool.get_name()
         self._tools[tool_name] = tool
 
     def use_tool(self, tool_name: str, **params) -> ToolResult:
-        """Usa un tool registrato"""
+        """Usa un tool registrato (solo per ReAct mode)"""
+        if not self._react_mode:
+            return ToolResult(
+                success=False,
+                error="Tool usage not available in Acting mode",
+                execution_time=0.0
+            )
+
         if tool_name not in self._tools:
             return ToolResult(
                 success=False,
@@ -482,8 +602,8 @@ IMPORTANT:
                 success=True,
                 result={
                     "status": f"{self.__class__.__name__} ready",
-                    "tools": self.get_available_tools(),
-                    "react_enabled": True
+                    "mode": "react" if self._react_mode else "acting",
+                    "tools": self.get_available_tools() if self._react_mode else [],
                 }
             )
         except Exception as e:
@@ -496,8 +616,8 @@ IMPORTANT:
             )
 
     def get_available_tools(self) -> List[str]:
-        """Lista tool disponibili"""
-        return list(self._tools.keys())
+        """Lista tool disponibili (solo per ReAct mode)"""
+        return list(self._tools.keys()) if self._react_mode else []
 
     def get_status(self) -> AgentStatus:
         """Status corrente"""
@@ -511,6 +631,7 @@ IMPORTANT:
                 **self._stats.copy(),
                 "agent_id": self.agent_id,
                 "status": self._status.value,
+                "mode": "react" if self._react_mode else "acting",
                 "tools_count": len(self._tools),
                 "current_task_id": (
                     self._current_task["task_id"] if self._current_task else None
@@ -554,32 +675,34 @@ IMPORTANT:
             "agent_id": self.agent_id,
             "class_name": self.__class__.__name__,
             "description": self._generate_agent_description(),
+            "mode": "react" if self._react_mode else "acting",
             "tools": self.get_available_tools(),
             "tool_schemas": [],
             "status": self._status.value,
             "stats": {
                 "tasks_completed": self._stats["tasks_completed"],
                 "tasks_failed": self._stats["tasks_failed"],
-                "total_react_steps": self._stats["total_react_steps"]
+                "total_steps": self._stats["total_react_steps"]
             }
         }
 
-        # Aggiungi schema dettagliato di ogni tool
-        for tool_name, tool in self._tools.items():
-            if hasattr(tool, 'get_schema'):
-                schema = tool.get_schema()
-                capabilities["tool_schemas"].append({
-                    "name": tool_name,
-                    "description": schema.get("description", ""),
-                    "parameters": schema.get("parameters", []),
-                    "tags": schema.get("tags", [])
-                })
+        # Aggiungi schema dettagliato di ogni tool (solo ReAct mode)
+        if self._react_mode:
+            for tool_name, tool in self._tools.items():
+                if hasattr(tool, 'get_schema'):
+                    schema = tool.get_schema()
+                    capabilities["tool_schemas"].append({
+                        "name": tool_name,
+                        "description": schema.get("description", ""),
+                        "parameters": schema.get("parameters", []),
+                        "tags": schema.get("tags", [])
+                    })
 
         return capabilities
 
     def _generate_agent_description(self) -> str:
         """
-        Genera descrizione automatica basata su tool e classe.
+        Genera descrizione automatica basata su mode, tool e classe.
         Override in agent specifici per descrizioni custom.
         Returns:
             str: Descrizione dell'agent
@@ -594,7 +717,7 @@ IMPORTANT:
             "SynthesisAgent": "Synthesis agent for combining information and generating comprehensive outputs",
             "ValidationAgent": "Validation agent for quality checks and data verification",
             "EmailAgent": "Email processing agent for reading and managing email communications",
-            "EmailAgentReAct": "Email processing agent with ReAct reasoning for intelligent email handling",
+            "NotionWriterAgent": "Notion writing agent for creating and updating pages with markdown support",
             "WeatherAgent": "Weather agent for meteorological information and forecasts",
             "MathAgent": "Mathematical agent for calculations and numerical processing"
         }
@@ -603,52 +726,35 @@ IMPORTANT:
         if class_name in descriptions:
             base_desc = descriptions[class_name]
         else:
-            base_desc = f"{class_name} - Specialized agent with {len(self._tools)} tools"
+            base_desc = f"{class_name} - Specialized agent"
 
-        # Aggiungi info sui tool principali
-        if self._tools:
+        # Aggiungi mode info
+        mode_desc = "with ReAct pattern and tool usage" if self._react_mode else "with direct Acting pattern for reasoning tasks"
+        base_desc += f" operating {mode_desc}"
+
+        # Aggiungi info sui tool principali (solo ReAct)
+        if self._react_mode and self._tools:
             tool_names = list(self._tools.keys())[:3]  # Prime 3 tool
             if tool_names:
-                base_desc += f". Main capabilities: {', '.join(tool_names)}"
+                base_desc += f". Main tools: {', '.join(tool_names)}"
                 if len(self._tools) > 3:
                     base_desc += f" and {len(self._tools) - 3} more"
 
         return base_desc
 
     def __str__(self) -> str:
-        return f"ReactAgent(id={self.agent_id}, status={self._status.value})"
+        mode = "ReAct" if self._react_mode else "Acting"
+        return f"{mode}Agent(id={self.agent_id}, status={self._status.value})"
 
     def __repr__(self) -> str:
         return (f"BaseAgent(id='{self.agent_id}', "
                 f"status='{self._status.value}', "
-                f"tools={len(self._tools)}, react_enabled=True)")
-
-
-# ===== ESEMPIO AGENT DERIVATO =====
-
-class EmailAgentReAct(BaseAgent):
-    """Esempio di agent che eredita ReAct automaticamente"""
-
-    def __init__(self, agent_id: str, blackboard: BlackBoard,
-                 llm_client, gmail_credentials: Dict):
-        super().__init__(agent_id, blackboard, llm_client)
-        self.gmail_credentials = gmail_credentials
-        self.initialize()  # Auto-inizializza con ReAct
-
-    def setup_tools(self):
-        """UNICO metodo da implementare - registra tool specifici"""
-        # Esempio: registrare GmailReaderTool
-        # gmail_tool = GmailReaderTool(self.gmail_credentials)
-        # self.register_tool(gmail_tool)
-        pass
+                f"mode={'react' if self._react_mode else 'acting'}, "
+                f"tools={len(self._tools)})")
 
 
 if __name__ == "__main__":
-    print("=== BASE AGENT REACT STANDARDIZZATO ===")
-    print("Ogni agent derivato eredita automaticamente:")
-    print("- ReAct loop completo")
-    print("- System prompt con tool auto-discovery")
-    print("- Integration blackboard per observations")
-    print("- LLM client configurabile")
-    print("\nGli agent derivati devono solo implementare setup_tools()!")
-    print("Tutto è completamente sincrono e thread-safe!")
+    print("=== BASE AGENT CON REACT/ACTING CONFIGURABILE ===")
+    print("React mode (react=True):  Tool usage + PAUSE/Observation loop")
+    print("Acting mode (react=False): No tool + single-shot direct reasoning")
+    print("\nOgni agent derivato puÃ² scegliere il mode nel constructor!")

@@ -11,7 +11,6 @@ from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime, timezone
 from enum import Enum
 
-
 from multi_agent_system.core.black_board import BlackBoard
 from multi_agent_system.core.messages import HumanMessage, create_agent_result
 from multi_agent_system.core.base_agent import BaseAgent
@@ -225,7 +224,7 @@ Remember:
             if capabilities.get('tool_details'):
                 agent_desc += "\n  Tool capabilities:"
                 for tool in capabilities['tool_details']:
-                    agent_desc += f"\n    • {tool['name']}: {tool['description']}"
+                    agent_desc += f"\n    â€¢ {tool['name']}: {tool['description']}"
 
             agent_descriptions.append(agent_desc)
 
@@ -309,7 +308,9 @@ Remember:
                 system=system_prompt,
                 user=conversation
             )
-            print(f"[Manager] Step {react_steps} LLM response:\n{llm_response}\n")
+            import textwrap
+            wrapped_response = textwrap.fill(llm_response, width=80)
+            print(f"[Manager] Step {react_steps} LLM response:\n{wrapped_response}\n")
 
             # Check se ha risposta finale
             if "Answer:" in llm_response:
@@ -378,9 +379,48 @@ Remember:
             "react_steps": react_steps
         }
 
+    def _extract_action_json_robust(self, text: str, action: str = "create_task") -> Optional[Dict[str, Any]]:
+        """
+        Estrae JSON da Action: {action}: {json} gestendo qualsiasi livello di annidamento.
+
+        Args:
+            text: Testo da cui estrarre il JSON
+            action: Nome dell'azione (default: "create_task")
+
+        Returns:
+            Optional[Dict]: JSON estratto o None se non trovato/invalido
+        """
+        try:
+            # Trova l'inizio del pattern
+            pattern = f"Action:\\s*{re.escape(action)}:\\s*"
+            match = re.search(pattern, text, re.DOTALL)
+
+            if not match:
+                return None
+
+            start_pos = match.end()
+
+            # Trova la prima graffa
+            while start_pos < len(text) and text[start_pos] != '{':
+                start_pos += 1
+
+            if start_pos >= len(text):
+                return None
+
+            # Usa JSONDecoder per parsing automatico e robusto
+            decoder = json.JSONDecoder()
+            try:
+                obj, end_idx = decoder.raw_decode(text, start_pos)
+                return obj
+            except json.JSONDecodeError:
+                return None
+
+        except Exception:
+            return None
+
     async def _process_create_task_action(self, llm_response: str) -> Dict[str, Any]:
         """
-        Processa azione di creazione task.
+        Processa azione di creazione task con estrazione JSON robusta.
 
         Args:
             llm_response: Risposta LLM con action
@@ -389,15 +429,11 @@ Remember:
             Dict: Risultato creazione task
         """
         try:
-            # Estrai parametri JSON
-            pattern = r"Action:\s*create_task:\s*(\{(?:[^{}]|{[^}]*})*\})"
-            match = re.search(pattern, llm_response, re.DOTALL)
+            # Estrai parametri JSON usando il metodo robusto
+            params = self._extract_action_json_robust(llm_response, "create_task")
 
-            if not match:
+            if not params:
                 return {"success": False, "error": "Could not parse create_task action"}
-
-            params_json = match.group(1)
-            params = json.loads(params_json)
 
             # Validazione parametri
             agent_id = params.get("agent_id")
@@ -421,7 +457,7 @@ Remember:
                 task_type=task_type,
                 task_data=task_data,
                 created_by=self.manager_id
-            )
+            )  # qua viene creata la task e invokati gli altri agenti
 
             # Traccia task attivo
             self._active_tasks[task_id] = {
@@ -457,14 +493,12 @@ Remember:
             Dict: Status del task
         """
         try:
-            # Estrai parametri
-            pattern = r"Action:\s*check_task:\s*({.*?})"
-            match = re.search(pattern, llm_response, re.DOTALL)
+            # Estrai parametri usando il metodo robusto
+            params = self._extract_action_json_robust(llm_response, "check_task")
 
-            if not match:
+            if not params:
                 return {"success": False, "error": "Could not parse check_task action"}
 
-            params = json.loads(match.group(1))
             task_id = params.get("task_id")
             agent_id = params.get("agent_id")
 
@@ -620,7 +654,7 @@ Remember:
             instruction_text=instruction,
             instruction_type=instruction_type,
             expires_in_minutes=expires_in_minutes,
-            priority_level=1,  # Alta priorità per correzioni
+            priority_level=1,  # Alta prioritÃ  per correzioni
             added_by=self.manager_id
         )
 
@@ -648,7 +682,7 @@ Remember:
                 instruction_text=instruction,
                 instruction_type=instruction_type,
                 expires_in_minutes=expires_in_minutes,
-                priority_level=2,  # Media priorità per broadcast
+                priority_level=2,  # Media prioritÃ  per broadcast
                 added_by=self.manager_id
             )
             instruction_ids.append(instr_id)

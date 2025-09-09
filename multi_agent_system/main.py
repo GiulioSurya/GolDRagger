@@ -8,8 +8,9 @@ from typing import Dict, Any, Optional
 from multi_agent_system.core.black_board import BlackBoard
 from multi_agent_system.core.manager import AgentManager
 from multi_agent_system.core.messages import create_human_message
-from multi_agent_system.core.llm import LLM
+from multi_agent_system.core.llm import LlmProvider
 from multi_agent_system.agents.notion_agent import NotionAgentFactory
+from multi_agent_system.agents.syntetic_agent import SyntheticAgentFactory
 
 
 class MultiAgentSystem:
@@ -28,8 +29,7 @@ class MultiAgentSystem:
         """
         # Core components
         self.blackboard = BlackBoard()
-        self.llm_client = LLM()
-        self.llm_client.__post_init__()
+        self.llm_client = LlmProvider.IBM_WATSONX.get_instance()
         self.llm_client.set_react_mode(True)
         self.manager = AgentManager(self.blackboard, self.llm_client)
 
@@ -53,8 +53,15 @@ class MultiAgentSystem:
             default_parent_id=self.default_parent_id
         )
 
+        syntetic_agent= SyntheticAgentFactory.create_executive_agent(
+            agent_id="synthetic_react_agent",
+            blackboard=self.blackboard,
+            llm_client=self.llm_client
+        )
+
         # Registra nel manager
         self.manager.register_agent(notion_agent)
+        self.manager.register_agent(syntetic_agent)
 
     async def query(self, user_input: str, user_id: str = "user") -> str:
         """
@@ -123,7 +130,17 @@ if __name__ == "__main__":
     system = create_system(NOTION_TOKEN, "page_id", DEFAULT_PARENT_ID)
 
     # Test queries
-    query = "scrivo una pagina su notion in cui elenchi le 10 migliori città italiane"
+    query = """"
+    Analizza le performance del nostro team degli ultimi 3 mesi utilizzando questi dati:
+    
+    - Q1: Fatturato €45K, 12 clienti, soddisfazione 78%
+    - Q2: Fatturato €52K, 15 clienti, soddisfazione 82% 
+    - Q3: Fatturato €61K, 18 clienti, soddisfazione 85%
+    - Nuovo prodotto lanciato in Q2 contribuisce 35% del fatturato Q3
+    - Team cresciuto da 8 a 12 persone
+    
+    Crea un executive summary con raccomandazioni strategiche e pubblicalo su Notion con titolo 'Q1-Q3 Performance Review'.
+    """
 
     system.query_sync(query)
 
