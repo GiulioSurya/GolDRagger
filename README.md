@@ -2,6 +2,8 @@
 
 A multi-agent framework built from scratch implementing blackboard architecture with ReAct pattern coordination. The system enables specialized agents to collaborate on complex workflows through shared memory and intelligent task delegation.
 
+[![Multi-Agent System Demo](https://img.youtube.com/vi/WNP4KKa8Xg0/maxresdefault.jpg)](https://www.youtube.com/watch?v=WNP4KKa8Xg0)
+
 ## Architecture Overview
 
 The system uses a blackboard architecture where agents communicate through shared state and a manager coordinates task execution using the ReAct (Reasoning and Acting) pattern.
