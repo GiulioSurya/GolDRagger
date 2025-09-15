@@ -2,19 +2,16 @@ from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timezone
 import threading
-import time
 import re
 import json
 from enum import Enum
-from multi_agent_system.core.prompts import BASE_REACT_PROMPT, BASE_ACTING_PROMPT
-import textwrap
 
 # Import dai moduli esistenti
 from multi_agent_system.core.messages import (
-    BaseMessage, create_agent_response, create_agent_result, AgentResult
-)
+    BaseMessage, create_agent_response)
 from multi_agent_system.core.tool_base import ToolBase, ToolResult
 from multi_agent_system.core.black_board import BlackBoard, BlackboardChange
+from multi_agent_system.core.utility.agent_strategies import (_ReactStrategy, _ActingStrategy)
 
 
 class AgentStatus(Enum):
@@ -24,262 +21,13 @@ class AgentStatus(Enum):
     ERROR = "error"
 
 
-# ===== STRATEGY PATTERN INTERNO =====
-
-class _PromptStrategy(ABC):
-    """Strategy interna per gestire diversi tipi di prompt"""
-
-    @abstractmethod
-    def execute_task_loop(self, agent: 'BaseAgent', task_data: Dict, task_id: str) -> AgentResult:
-        """Esegue il loop specifico per questa strategy"""
-        pass
-
-    @abstractmethod
-    def build_system_prompt(self, agent: 'BaseAgent') -> str:
-        """Costruisce il system prompt per questa strategy"""
-        pass
-
-
-class _ReactStrategy(_PromptStrategy):
-    """Strategy per ReAct pattern con tool usage e loop PAUSE/Observation"""
-
-    def build_system_prompt(self, agent: 'BaseAgent') -> str:
-        """Costruisce system prompt ReAct con tool descriptions auto-injected"""
-
-        # Costruisce descrizioni tool automaticamente
-        tools_descriptions = []
-
-        for tool_name, tool in agent._tools.items():
-            schema = tool.get_schema()
-
-            # Estrae parametri con tipi
-            params_info = []
-            for param in schema.get('parameters', []):
-                param_desc = f"{param['name']} ({param['type']})"
-                if not param.get('required', True):
-                    param_desc += " [optional]"
-                if param.get('description'):
-                    param_desc += f": {param['description']}"
-
-                # Include valori permessi se disponibili
-                if param.get('allowed_values'):
-                    allowed_vals = ', '.join(map(str, param['allowed_values']))
-                    param_desc += f" [allowed: {allowed_vals}]"
-
-                # Include range se disponibili
-                if param.get('min_value') is not None or param.get('max_value') is not None:
-                    min_val = param.get('min_value', '')
-                    max_val = param.get('max_value', '')
-                    param_desc += f" [range: {min_val}-{max_val}]"
-
-                # Include valore default se disponibile
-                if param.get('default') is not None:
-                    param_desc += f" [default: {param['default']}]"
-
-                params_info.append(param_desc)
-
-            tool_desc = f"""
-    - {tool_name}: {schema['description']}
-      Parameters: {', '.join(params_info) if params_info else 'none'}
-      Example: Action: {tool_name}: {{"param1": "value1", "param2": "value2"}}"""
-
-            tools_descriptions.append(tool_desc)
-
-        # Aggiunge system instructions dinamiche dalla blackboard
-        system_instructions = agent.blackboard.get_system_instructions_for_agent(
-            agent.agent_id, active_only=True
-        )
-
-        additional_instructions = ""
-        if system_instructions:
-            instructions_text = [f"- {instr.instruction_text}" for instr in system_instructions]
-            additional_instructions = f"""
-
-    ADDITIONAL DYNAMIC INSTRUCTIONS:
-    {chr(10).join(instructions_text)}"""
-
-        # Combina tutto
-        tools_section = "\n".join(tools_descriptions) if tools_descriptions else "No tools available"
-
-        final_prompt = BASE_REACT_PROMPT.format(
-            tools_description=tools_section
-        ) + additional_instructions
-
-        return final_prompt
-
-    def execute_task_loop(self, agent: 'BaseAgent', task_data: Dict, task_id: str) -> AgentResult:
-        """Esegue il ReAct loop con tool usage e PAUSE/Observation"""
-        start_time = time.time()
-        react_steps = 0
-        tools_used = []
-        observations = []
-        max_steps = 10  # Limite safety per evitare loop infiniti
-
-        try:
-            # Costruisce system prompt con tool info auto-injected
-            system_prompt = self.build_system_prompt(agent)
-
-            # Prompt iniziale per il task
-            conversation = f"Task: {task_data}\n\nPlease start with your first Thought about this task."
-
-            while react_steps < max_steps:
-                # Chiama LLM
-                llm_response = agent.llm_client.invoke(
-                    system=system_prompt,
-                    user=conversation
-                )
-                wrapped_response = textwrap.fill(llm_response, width=80)
-                print(f"[{agent.agent_id}] Acting Response: {wrapped_response}")
-
-
-                # Parsing della risposta LLM
-                if "Answer:" in llm_response:
-                    # LLM ha dato risposta finale
-                    answer = agent._extract_answer(llm_response)
-                    return create_agent_result(
-                        success=True,
-                        agent_id=agent.agent_id,
-                        data={"answer": answer, "task_data": task_data},
-                        execution_time=time.time() - start_time,
-                        react_steps=react_steps,
-                        tools_used=tools_used,
-                        observations=observations
-                    )
-
-                elif "Action:" in llm_response and "PAUSE" in llm_response:
-                    # LLM vuole eseguire un'azione
-                    action_result = agent._process_action(llm_response, task_id)
-
-                    if action_result["success"]:
-                        # Tool eseguito con successo
-                        tool_name = action_result["tool_name"]
-                        observation = action_result["observation"]
-
-                        # Tracking
-                        if tool_name not in tools_used:
-                            tools_used.append(tool_name)
-                        observations.append(observation)
-
-                        # Aggiorna stats
-                        agent._stats["tools_used_count"][tool_name] = (
-                                agent._stats["tools_used_count"].get(tool_name, 0) + 1
-                        )
-
-                        # Salva observation sulla blackboard
-                        agent._save_observation_to_blackboard(task_id, react_steps, observation)
-
-                        # Continua conversazione con observation
-                        conversation += f"\n\n{llm_response}\n\nObservation: {observation}"
-
-                    else:
-                        # Tool fallito
-                        error_obs = f"Error: {action_result['error']}"
-                        observations.append(error_obs)
-                        conversation += f"\n\n{llm_response}\n\nObservation: {error_obs}"
-
-                    react_steps += 1
-
-                else:
-                    # Risposta LLM non nel formato atteso
-                    conversation += f"\n\n{llm_response}\n\nPlease follow the format: Thought: ... Action: tool_name: params PAUSE"
-
-            # Raggiunto limite step
-            return create_agent_result(
-                success=False,
-                agent_id=agent.agent_id,
-                error=f"Reached maximum ReAct steps ({max_steps})",
-                execution_time=time.time() - start_time,
-                react_steps=react_steps,
-                tools_used=tools_used,
-                observations=observations
-            )
-
-        except Exception as e:
-            return create_agent_result(
-                success=False,
-                agent_id=agent.agent_id,
-                error=f"ReAct loop failed: {str(e)}",
-                execution_time=time.time() - start_time,
-                react_steps=react_steps,
-                tools_used=tools_used,
-                observations=observations
-            )
-
-
-class _ActingStrategy(_PromptStrategy):
-    """Strategy per Acting pattern: single-shot diretto, no tool, solo reasoning"""
-
-    def build_system_prompt(self, agent: 'BaseAgent') -> str:
-        """Costruisce system prompt Acting senza tool descriptions"""
-
-        # Aggiunge system instructions dinamiche dalla blackboard
-        system_instructions = agent.blackboard.get_system_instructions_for_agent(
-            agent.agent_id, active_only=True
-        )
-
-        additional_instructions = ""
-        if system_instructions:
-            instructions_text = [f"- {instr.instruction_text}" for instr in system_instructions]
-            additional_instructions = f"""
-
-    ADDITIONAL DYNAMIC INSTRUCTIONS:
-    {chr(10).join(instructions_text)}"""
-
-        return BASE_ACTING_PROMPT + additional_instructions
-
-    def execute_task_loop(self, agent: 'BaseAgent', task_data: Dict, task_id: str) -> AgentResult:
-        """Esegue single-shot diretto: una chiamata LLM e basta"""
-        start_time = time.time()
-
-        try:
-            # Costruisce system prompt senza tool info
-            system_prompt = self.build_system_prompt(agent)
-
-            # Prompt diretto per il task
-            user_prompt = f"Task: {task_data}\n\nPlease provide your direct response to complete this task efficiently."
-
-            # Singola chiamata LLM
-            llm_response = agent.llm_client.invoke(
-                system=system_prompt,
-                user=user_prompt
-            )
-
-            wrapped_response = textwrap.fill(llm_response, width=80)
-            print(f"[{agent.agent_id}] Acting Response: {wrapped_response}")
-
-            agent._save_observation_to_blackboard(task_id, 0, f"Direct response: {llm_response[:100]}...")
-
-            return create_agent_result(
-                success=True,
-                agent_id=agent.agent_id,
-                data={"answer": llm_response.strip(), "task_data": task_data},
-                execution_time=time.time() - start_time,
-                react_steps=1,  # Un singolo "step"
-                tools_used=[],  # Nessun tool usato
-                observations=[f"Direct reasoning completed"]
-            )
-
-        except Exception as e:
-            return create_agent_result(
-                success=False,
-                agent_id=agent.agent_id,
-                error=f"Acting execution failed: {str(e)}",
-                execution_time=time.time() - start_time,
-                react_steps=0,
-                tools_used=[],
-                observations=[]
-            )
-
-
-# ===== BASE AGENT AGGIORNATO =====
-
 class BaseAgent(ABC):
     """
     Classe base ABC standardizzata con ReAct/Acting pattern configurabile.
 
     CARATTERISTICHE AUTOMATICHE:
     - System prompt ReAct O Acting configurabile via parametro
-    - ReAct mode: Tool usage + loop PAUSE/Observation
+    - ReAct mode: Tool usage + loop PAUSE/Observation con schema JSON pulito
     - Acting mode: No tool + single-shot diretto
     - LLM client auto-configurato per mode scelto
     - Integration con blackboard per observations
@@ -288,7 +36,7 @@ class BaseAgent(ABC):
     GLI AGENT DERIVATI DEVONO SOLO:
     - Implementare setup_tools() per registrare i loro tool (se react=True)
     - Passare LLM client nel constructor
-    - Il resto Ã¨ automatico!
+    - Il resto è automatico!
     """
 
     def __init__(self, agent_id: str, blackboard: BlackBoard, llm_client, react: bool = True):
@@ -338,8 +86,14 @@ class BaseAgent(ABC):
         """Osserva blackboard per task assegnati a questo agent"""
 
         def on_blackboard_change(change: BlackboardChange):
+            """
+            rappresenta il callable che viene chiamato quanto si triggera l'observare, fa l'update della BlackBoard
+            e chiama il metodo che la esegue
+            :param change:
+            :return:
+            """
             try:
-                # Controlla se Ã¨ un task per questo agent
+                # Controlla se è un task per questo agent
                 if (change.key.startswith(f"task_{self.agent_id}_") and
                         change.new_value and
                         change.new_value.get("status") == "pending"):
@@ -437,7 +191,7 @@ class BaseAgent(ABC):
         except Exception:
             return None
 
-    def _process_action(self, llm_response: str, task_id: str) -> Dict[str, Any]:
+    def _process_action(self, llm_response: str) -> Dict[str, Any]:
         """Processa azione richiesta dall'LLM ed esegue tool (solo ReAct mode) con estrazione JSON robusta"""
         if not self._react_mode:
             return {
@@ -531,7 +285,7 @@ class BaseAgent(ABC):
         Registra i tool specifici dell'agent.
         UNICO METODO DA IMPLEMENTARE negli agent derivati.
 
-        NOTE: Se react=False, questo metodo puÃ² essere vuoto o non registrare tool
+        NOTE: Se react=False, questo metodo può essere vuoto o non registrare tool
 
         Esempio per ReAct mode:
         def setup_tools(self):
@@ -637,7 +391,7 @@ class BaseAgent(ABC):
                     self._current_task["task_id"] if self._current_task else None
                 )
             }
-
+    #todo non usato, decidere se tenere o meno
     def call_other_agent(self, target_agent_id: str, task_type: str, task_data: Dict) -> str:
         """Chiama altro agent via blackboard"""
         task_id = self.blackboard.create_task(
@@ -700,6 +454,7 @@ class BaseAgent(ABC):
 
         return capabilities
 
+    #todo, poco standardizzata, deve essere più generica e applicabile
     def _generate_agent_description(self) -> str:
         """
         Genera descrizione automatica basata su mode, tool e classe.
@@ -710,11 +465,11 @@ class BaseAgent(ABC):
         # Descrizione base dal nome classe
         class_name = self.__class__.__name__
 
-        # Mapping nomi comuni
+        #todo decidere se usare o eliminare
         descriptions = {
             "RAGAgent": "Retrieval-Augmented Generation agent for document search and contextual responses",
             "AnalysisAgent": "Analysis agent for data processing, sentiment analysis, and insights extraction",
-            "SynthesisAgent": "Synthesis agent for combining information and generating comprehensive outputs",
+            "SyntheticAgent": "Synthesis agent for combining information and generating comprehensive outputs, always require all the query",
             "ValidationAgent": "Validation agent for quality checks and data verification",
             "EmailAgent": "Email processing agent for reading and managing email communications",
             "NotionWriterAgent": "Notion writing agent for creating and updating pages with markdown support",
@@ -752,9 +507,3 @@ class BaseAgent(ABC):
                 f"mode={'react' if self._react_mode else 'acting'}, "
                 f"tools={len(self._tools)})")
 
-
-if __name__ == "__main__":
-    print("=== BASE AGENT CON REACT/ACTING CONFIGURABILE ===")
-    print("React mode (react=True):  Tool usage + PAUSE/Observation loop")
-    print("Acting mode (react=False): No tool + single-shot direct reasoning")
-    print("\nOgni agent derivato puÃ² scegliere il mode nel constructor!")

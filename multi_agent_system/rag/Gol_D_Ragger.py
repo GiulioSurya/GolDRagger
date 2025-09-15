@@ -74,6 +74,7 @@ class GoldDRagger:
         Returns:
             Risposta generata dal modello
         """
+
         # Ottieni client LLM
         llm_client = self.ollama_connection.get_llm_client()
 

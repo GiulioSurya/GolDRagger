@@ -54,25 +54,22 @@ class BlackboardEntry(BaseModel):
                 self.access_history = self.access_history[-10:]
 
 
-class BlackBoard(BaseModel):
+class BlackBoard():
     """
     Lavagna condivisa tra agent del sistema multi-agent.
     Fornisce storage thread-safe con sistema di notifiche.
     """
 
-    def __init__(self, **data):
-        super().__init__(**data)
-        # Storage principale - thread-safe
+    def __init__(self):
+
+        # Storage principale per le key
         self._storage: Dict[str, BlackboardEntry] = {}
         self._lock = threading.RLock()  # ReentrantLock per accesso thread-safe
-
         # Sistema di notifiche
         self._observers: Set[Callable[[BlackboardChange], None]] = set()
-
         # Storia dei cambiamenti (utile per debugging)
         self._change_history: List[BlackboardChange] = []
         self._max_history_size = 1000  # Limita la storia per memoria
-
         # Statistiche
         self._stats = {
             'total_reads': 0,

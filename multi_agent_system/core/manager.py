@@ -17,7 +17,8 @@ from multi_agent_system.core.base_agent import BaseAgent
 
 
 class ManagerStatus(Enum):
-    """Stati del Manager"""
+    """Stati del Manager
+    utile per il debugging"""
     IDLE = "idle"
     ORCHESTRATING = "orchestrating"
     WAITING_AGENTS = "waiting_agents"
@@ -35,47 +36,55 @@ class AgentManager:
     # System prompt ReAct per orchestrazione
     MANAGER_REACT_PROMPT = """You are the Manager Agent, the orchestrator of a multi-agent system.
 
-Your role is to analyze user requests and delegate tasks to specialized agents through a blackboard system.
-
-You operate using the ReAct (Reasoning and Acting) pattern:
-
-WORKFLOW:
-1. Thought: Analyze the user request and determine which agent(s) to use
-2. Action: Create a task for the appropriate agent using the exact format shown
-3. PAUSE: Wait for the agent to complete the task
-4. Observation: Review the task result from the agent
-5. Continue until you have all information needed
-6. Answer: Provide the final synthesized response to the user
-
-ACTION FORMAT for creating tasks:
-Action: create_task: {{"agent_id": "agent_name", "task_type": "type", "task_data": {{"key": "value"}}}}
-
-ACTION FORMAT for checking task status:
-Action: check_task: {{"task_id": "task_uuid", "agent_id": "agent_name"}}
-
-IMPORTANT RULES:
-- You can only delegate to agents that are registered (see AVAILABLE AGENTS below)
-- Always wait for task completion before creating dependent tasks
-- If an agent fails, try alternative approaches or agents
-- Synthesize results from multiple agents when needed
-- ALWAYS end with Answer: when you have the final response
-
-TERMINATION RULES:
-- When you have received all needed information from agents, immediately provide Answer:
-- Do NOT create additional actions if you already have the complete answer
-- Do NOT use "Action:" unless you need to create_task or check_task
-- After receiving Observation with complete results, go directly to Answer:
-- If you have sufficient information to answer the user, do not delay - provide Answer:
-
-AVAILABLE AGENTS:
-{agents_description}
-
-Remember:
-- Each agent has specific capabilities listed above
-- Use agent_id exactly as shown in the list
-- Match task requirements to agent capabilities
-- You can chain multiple agents for complex requests
-- TERMINATE with Answer: as soon as you have complete information"""
+            Your role is to analyze user requests and delegate tasks to specialized agents through a blackboard system.
+            
+            You operate using the ReAct (Reasoning and Acting) pattern:
+            
+            WORKFLOW:
+            1. Thought: Analyze the user request and determine which agent(s) to use
+            2. Action: Create a task for the appropriate agent using the exact format shown
+            3. PAUSE: Wait for the agent to complete the task
+            4. Observation: Review the task result from the agent
+            5. Continue until you have all information needed
+            6. Answer: Provide the final synthesized response to the user
+            
+            ACTION FORMAT for creating tasks:
+            Action: create_task: {{"agent_id": "agent_name", "task_type": "type", "task_data": {{"key": "value"}}}}
+            
+            ACTION FORMAT for checking task status:
+            Action: check_task: {{"task_id": "task_uuid", "agent_id": "agent_name"}}
+            
+            IMPORTANT RULES:
+            - You can only delegate to agents that are registered (see AVAILABLE AGENTS below)
+            - Always wait for task completion before creating dependent tasks
+            - If an agent fails, try alternative approaches or agents
+            - PRESERVE AGENT OUTPUTS: When agents provide detailed analysis or synthesis, include their COMPLETE responses in your final Answer
+            - Do NOT summarize, truncate, or paraphrase agent outputs - quote them fully with clear attribution
+            - ALWAYS end with Answer: when you have the final response
+            
+            TERMINATION RULES:
+            - When you have received all needed information from agents, immediately provide Answer:
+            - Do NOT create additional actions if you already have the complete answer
+            - Do NOT use "Action:" unless you need to create_task or check_task
+            - After receiving Observation with complete results, go directly to Answer:
+            - If you have sufficient information to answer the user, do not delay - provide Answer:
+            
+            OUTPUT PRESERVATION RULES:
+            - Include complete agent responses with attribution: "AgentName provided: [full response]"
+            - Preserve all details, insights, and analysis from specialist agents
+            - Do not lose valuable agent work through summarization
+            - Structure your Answer to show all agent contributions clearly
+            
+            AVAILABLE AGENTS:
+            {agents_description}
+            
+            Remember:
+            - Each agent has specific capabilities listed above
+            - Use agent_id exactly as shown in the list
+            - Match task requirements to agent capabilities
+            - You can chain multiple agents for complex requests
+            - PRESERVE all specialist agent outputs in your final response
+            - TERMINATE with Answer: as soon as you have complete information"""
 
     def __init__(self, blackboard: BlackBoard, llm_client):
         """
@@ -290,7 +299,7 @@ Remember:
             Dict: Risultato orchestrazione
         """
         react_steps = 0
-        max_steps = 3  # Limite per evitare loop infiniti
+        max_steps = 6  # Limite per evitare loop infiniti
         tasks_executed = []
         agents_used = set()
 
@@ -310,7 +319,8 @@ Remember:
             )
             import textwrap
             wrapped_response = textwrap.fill(llm_response, width=80)
-            print(f"[Manager] Step {react_steps} LLM response:\n{wrapped_response}\n")
+            print("\n------------------------[Manager]---------------------------\n")
+            print(f" Step {react_steps} LLM response:\n{wrapped_response}\n")
 
             # Check se ha risposta finale
             if "Answer:" in llm_response:
